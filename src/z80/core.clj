@@ -1,4 +1,4 @@
-(ns z80.emulator
+(ns z80.core
   (:require [z80.vdp :as vdp]
             [quil.core :as q])
   (:import [com.codingrodent.microprocessor IMemory IBaseDevice]

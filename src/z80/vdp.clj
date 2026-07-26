@@ -15,6 +15,7 @@
   read-buffer
   current-scan-line
   vblank-active?
+  hblank-active?
   sprite-collision?])
 
 (defn create-vdp []
@@ -30,20 +31,28 @@
     :operation 0               ;; Current operating mode (0, 1, 2, or 3).
     :read-buffer 0             ;; 8-bit VRAM cache.
     :current-scan-line 0       ;; V-COUNTER tracking.
+    :hblank-active? false      ;; NOTE: Need to track this in the GG version. Some games require more precise HBLANK handling.
     :vblank-active? false      ;; V-BLANK interrupt active flag.
     :sprite-collision? false})) ;; Sprite collision active flag.
 
 (defn get-v-counter [^VdpState vdp]
-  ;; Game Gear uses a dedicated screen/refresh timing model.
+  ;; PAL Hardware V-Counter mapping rules:
+  ;; Lines 0-242 count up linearly (0x00 to 0xF2).
+  ;; Lines 243-312 jump to 0xBA and increment to 0xFF.
   (let [line (int (.current-scan-line vdp))]
     (cond
-      (<= line 242) line
-      (<= line 312) (+ 0xBA (- line 243))
-      :else 0xFF)))
+      ;; Up to line 218 (0xDA), the counter matches the physical line
+      (<= line 218) line
+      ;; From line 219 to 261, the counter rolls back into the 0xD5 - 0xFF range
+      (<= line 261) (+ 0xBA (- line 219))
+      :else 0xFF))) ;; Safety boundary fallback
 
 (defn calculate-h-counter [^Z80Core cpu]
+  ;; The H-counter is purely dependent on the current Z80 line progress.
+  ;; 1 Z80 cycle = 1.5 H-Counter increments.
+  ;; NOTE: Tried keeping h-counter inside the VDP record, but this calculation is faster.
   (let [current-cycles (.getTStates cpu)
-        line-cycles (mod current-cycles 227)
+        line-cycles (mod current-cycles 227) ;; 227 cycles per line in PAL
         h-val (quot (* line-cycles 3) 2)]
     (if (<= h-val 225)
       h-val
@@ -158,13 +167,20 @@
         (= code-type 3) (assoc vdp :vram-pointer new-loc :operation 3 :first-byte? true)
         :else (assoc vdp :first-byte? true)))))
 
-
+;; NOTE: Slight change for the GG version.
 (defn read-status-port! [^VdpState vdp ^Z80Core cpu]
   (let [vblank-bit (if (:vblank-active? vdp) 0x80 0x00)
         collision-bit (if (:sprite-collision? vdp) 0x20 0x00)
+        ;; Note: The Master System/Game Gear status register bit 6 is 
+        ;; technically normal sprite overflow, but reading the register 
+        ;; clears both V-Blank AND H-Blank interrupt line requests hardware-wise.
         current-status (bit-or vblank-bit collision-bit)]
-    (.setInterrupt cpu false)
+    
+    ;; Do not clear the CPU pin directly here anymore; 
+    ;; Let the updated flags in the VDP state trigger the change naturally 
+    ;; during the execution loop's step synchronization phase.
     [current-status (assoc vdp 
                            :first-byte? true 
                            :vblank-active? false
+                           :hblank-active? false ;; <-- CLEAR H-BLANK ON READ
                            :sprite-collision? false)]))

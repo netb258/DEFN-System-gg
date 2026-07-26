@@ -1,6 +1,7 @@
 (ns z80.core
   (:require [z80.vdp :as vdp]
-            [quil.core :as q])
+            [quil.core :as q]
+            [clojure.java.io :as io])
   (:import [com.codingrodent.microprocessor IMemory IBaseDevice]
            [com.codingrodent.microprocessor.Z80 Z80Core]
            [com.codingrodent.microprocessor.Z80 CPUConstants$RegisterNames])
@@ -24,6 +25,7 @@
 ;; 0xC000 - 0xDFFF : System RAM (8KB)
 ;; 0xE000 - 0xFFFF : System RAM Mirror (Points to the same 8KB RAM)
 ;; They needed the mirror RAM addresses for convenience and also it apparantly saves on hardware.
+
 (def rom-cart-start 0x0000)
 (def rom-cart-end   0xBFFF)
 (def ram-start      0xC000)
@@ -31,48 +33,73 @@
 (def mram-start     0xE000)
 (def mram-end       0xFFFF)
 
-;; (def ^{:tag 'bytes} rom (byte-array 49152))    ;; 48KB max for a basic ROM with no mapper.
-;; Since we are now implementing the standard Sega Mapper our old static 48KB array needs to go.
 (def rom (atom (byte-array 0)))
-;; The stardard Sega Mapper splits the ROM space into 16kb pieces/slots
-;; and dynamically loads parts of large games into the ROM space.
-;; Track the current active bank index for each of the three 16KB slots
 (def mapper-banks (atom {:slot0 0
-                                 :slot1 1
-                                 :slot2 2}))
+                         :slot1 1
+                         :slot2 2}))
+
+;; 0xFFFC Control Register state (default 0). Tracks if SRAM is enabled.
+(def sram-control (atom 0))
+
+(defn md5-hash [^bytes rom-bytes]
+  (let [md (java.security.MessageDigest/getInstance "MD5")]
+    (.update md rom-bytes)
+    (format "%032x" (java.math.BigInteger. 1 (.digest md)))))
+
+;; NOTE: We are using delay, because we want to wait for the @rom to be loaded by load-rom-into-memory!
+(def sram-file-path (delay (str (md5-hash @rom) ".sav")))
+
+;; Standard SMS Cartridge RAM is usually 8KB or 16KB. We allocate 16KB.
+
+;; NOTE: This is changed for the GG version.
+;; The Game Gear supported bigger saves than the Master System.
+;; Allocate 32KB instead of 16KB
+(def ^{:tag 'bytes} cart-sram 
+  (delay
+    (let [file (io/file @sram-file-path)]
+      (if (.exists file)
+        (with-open [xin (io/input-stream file)]
+          (let [buf (byte-array 32768)] ;; Changed to 32KB
+            (.read xin buf)
+            buf))
+        (byte-array 32768))))) ;; Changed to 32KB
+
 (def ^{:tag 'bytes} sms-ram (byte-array 8192)) ;; 8KB of actual Work RAM
 
 (defn signed->unsigned
-  "Takes a signed byte (range -128 to 127) 
-  and converts it to an unsigned byte (range 0 to 255)."
+  "Takes a signed byte (range -128 to 127) and converts it to an unsigned byte (range 0 to 255)."
   ^long [^long signed-byte]
   (bit-and signed-byte 0xFF))
+
+(defn save-sram-to-disk!
+  "Flushes the current in-memory Cartridge SRAM to a local file."
+  []
+  (with-open [xout (io/output-stream @sram-file-path)]
+    (.write xout ^bytes @cart-sram)))
+
+(defn sram-enabled? 
+  "Returns true if the SRAM enable bit (Bit 3) is set in the 0xFFFC register."
+  []
+  (not= 0 (bit-and @sram-control 0x08)))
+
+;; NOTE: Changed for the GG version. Since we now use 32KB instead of 16KB.
+(defn get-sram-offset
+  "Calculates the offset in a 32KB SRAM chip based on Address and Bank Select bit (Bit 2)."
+  ^long [^long address]
+  (let [;; Bit 2 selects the 16KB bank: 0 or 16384
+        bank (if (not= 0 (bit-and @sram-control 0x04)) 16384 0)
+        ;; SRAM slot maps a full 16KB window from 0x8000 to 0xBFFF
+        sram-relative-addr (- address 0x8000)]
+    (+ bank sram-relative-addr)))
 
 (defn read-byte-from-mapper-slot
   "Returns an unsigned byte from a provided mapper slot and address."
   ^long [slot ^long address ^bytes read-only-memory]
   (let [bank-data (slot @mapper-banks)
         total-banks (quot (alength read-only-memory) 16384)
-        ;; Cleanly wraps around using mod calculation if the game is too small to have a third bank.
-        ;; They smallest Master System game shuld be 32KB (or two banks each 16KB).
         safe-bank (mod bank-data total-banks)
         real-offset (+ (* safe-bank 16384) address)]
     (signed->unsigned (aget read-only-memory real-offset))))
-
-;; NOTE: It is worth noting: games that don't use the standard Sega mapper
-;; will never write to the mapper registers (0xFFFD, 0xFFFE, 0xFFFF).
-;; This means that for those games, the mapper banks will allways stay as:
-;; :slot0 0
-;; :slot1 1
-;; :slot2 2
-;; Having these three slots as 16KB chunks is really convenient,
-;; because it maps cleanly to the SMS ROM Cartridge space (48KB):
-;; Slot 0 = (0 * 16384 = 0x0000) - Ends at 0x4000
-;; Slot 1 = (1 * 16384 = 0x4000) - Ends at 0x8000
-;; Slot 2 = (2 * 16384 = 0x8000) - Ends at 0xBFFF
-;; So basically they go from 0x0000 to 0xBFFF.
-;; This means that our setup works with those games
-;; that require the standard Sega mapper and those that do not.
 
 (def memory-bus
   (reify IMemory
@@ -82,36 +109,48 @@
           ;; --- SLOT 0 (0x0000 - 0x3FFF) ---
           (< address 0x4000)
           (if (< address 0x0400)
-            ;; First 1KB is strictly reserved by the Z80 for interrupt handling routines.
-            ;; This small space never gets swapped out.
             (signed->unsigned (aget active-rom address))
-            ;; Remainder of Slot 0 uses the mapper bank
             (read-byte-from-mapper-slot :slot0 address active-rom))
+          
           ;; --- SLOT 1 (0x4000 - 0x7FFF) ---
-          (< address 0x8000) (read-byte-from-mapper-slot :slot1 (- address 0x4000) active-rom)
-          ;; --- SLOT 2 (0x8000 - 0xBFFF) ---
-          (< address ram-start) (read-byte-from-mapper-slot :slot2 (- address 0x8000) active-rom)
+          (< address 0x8000) 
+          (read-byte-from-mapper-slot :slot1 (- address 0x4000) active-rom)
+          
+          ;; --- SLOT 2 / SRAM SPACE (0x8000 - 0xBFFF) ---
+          (< address ram-start) 
+          (if (sram-enabled?)
+            (signed->unsigned (aget @cart-sram (get-sram-offset address)))
+            (read-byte-from-mapper-slot :slot2 (- address 0x8000) active-rom))
+          
           ;; --- WORK RAM (0xC000 - 0xDFFF) ---
-          (< address mram-start) (signed->unsigned (aget sms-ram (- address ram-start)))
-          ;; --- RAM MIRROR (0xE000 - 0xFFFF) ---
-          :else (signed->unsigned (aget sms-ram (- address mram-start))))))
+          (< address mram-start) 
+          (signed->unsigned (aget sms-ram (- address ram-start)))
+          
+          ;; --- RAM MIRROR & MAPPER REGISTERS (0xE000 - 0xFFFF) ---
+          :else 
+          (signed->unsigned (aget sms-ram (- address mram-start))))))
 
     (^void writeByte [this ^int address ^int value]
       (cond
-        ;; ROM Space is read-only
+        ;; Write to Slot 2 SRAM (if enabled by the game)
+        (and (>= address 0x8000) (< address ram-start) (sram-enabled?))
+        (do
+          (aset-byte @cart-sram (get-sram-offset address) (unchecked-byte value))
+          #_(save-sram-to-disk!)) ;; Save to file instantly on write
+        
+        ;; ROM Space is otherwise read-only
         (< address ram-start) nil 
+        
         ;; Write to main Work RAM
-        (< address mram-start) (aset-byte sms-ram (- address ram-start) (unchecked-byte value))
+        (< address mram-start) 
+        (aset-byte sms-ram (- address ram-start) (unchecked-byte value))
+        
         ;; Write to Mirror RAM area & Mapper Registers
         :else
         (do
-          ;; Mirror the write down into the actual 8KB Work RAM
           (aset-byte sms-ram (- address mram-start) (unchecked-byte value))
-          ;; Intercept writes targeting the Mapper Registers (0xFFFD - 0xFFFF)
-          ;; and fill our Clojure atom with the data.
-          ;; The Sega Master System, uses Memory-Mapped I/O for its cartridge banking,
-          ;; so it's the job of the Memory Bus to do this, not the IO Bus.
           (cond
+            (= address 0xFFFC) (reset! sram-control value)
             (= address 0xFFFD) (swap! mapper-banks assoc :slot0 value)
             (= address 0xFFFE) (swap! mapper-banks assoc :slot1 value)
             (= address 0xFFFF) (swap! mapper-banks assoc :slot2 value))))
@@ -146,27 +185,6 @@
 ;; GG start button.
 ;; Bit 7 is START (1 = unpressed, 0 = pressed)
 (def gg-start-register (atom 0xFF))
-
-(defn check-sprite-collision! [^z80.vdp.VdpState vdp]
-  ;; In FluBBa's VDP test 47, Sprite 0 and Sprite 1 are defined at the very top of the SAT.
-  ;; Let's inspect the first two entries in VRAM's Sprite Attribute Table.
-  ;; Assuming default SAT location in VRAM (typically 0x3F00 for SMS, or check Reg 5/6)
-  (let [^bytes vram-arr (.vram vdp)
-        sat-base 0x3F00 ;; Standard SMS SAT base address
-        ;; Read Y coordinates for Sprites 0 and 1
-        y0 (signed->unsigned (aget vram-arr sat-base))
-        y1 (signed->unsigned (aget vram-arr (inc sat-base)))
-        ;; Read X coordinates (X-table starts 128 bytes after Y-table)
-        x0 (signed->unsigned (aget vram-arr (+ sat-base 0x80)))
-        x1 (signed->unsigned (aget vram-arr (+ sat-base 0x82)))]
-    ;; Check if both sprites are active (Y != 0xD0 on SMS terminates sprite rendering)
-    ;; and check if their coordinates overlap.
-    (if (and (not= y0 0xD0) 
-             (not= y1 0xD0)
-             (= y0 y1) 
-             (= x0 x1))
-      (assoc vdp :sprite-collision? true)
-      vdp)))
 
 ;; The io-bus will need to communicate with the CPU, even though we have not composed it yet.
 (declare cpu)
@@ -408,7 +426,7 @@
         overscan-color     (int (:overscan-color cfg))
         hide-left-8?       (boolean (:hide-left-8? cfg))
         vram-len           (int (alength vram-bytes))]
-    (fn [pixel-x pixel-y col-v-locked? row-h-locked?]
+    (fn [^long pixel-x ^long pixel-y col-v-locked? row-h-locked?]
       ;; 1. VERTICAL AXIS LOOKUPS
       ;; If vertical scroll locking is active (for column entries >= 24), bypass VDP scroll offsets.
       (let [actual-bg-y      (int (if col-v-locked? pixel-y (+ pixel-y base-scroll-y)))
@@ -587,14 +605,17 @@
     (SpriteData. visible-height sat-base-addr sat-info-table sprite-tile-base 
                           large-sprites? vram-bytes color-palette-cache img-pixels)))
 
+;; NOTE: The sprite drawing functions will also perform collision detection.
 (defn draw-single-sprite-line!
   "Renders only a SINGLE horizontal row of a SINGLE sprite matching the current scanline.
    This function draws one horizontal row of 8 pixels for one individual sprite on the current scanline.
 
    Note that the image buffer inside our SpriteData is a primitive array, ensuring high-speed rendering.
    Loops across the 8 horizontal pixels of the matching row to perform transparency,
-   clipping, and priority evaluations against pre-rendered background metadata."
-  [^SpriteData ctx pixel-x raw-tile-index fine-y current-screen-y]
+   clipping, and priority evaluations against pre-rendered background metadata.
+   
+   Tracks hardware sprite-on-sprite pixel collisions using Bit 29 (0x20000000) of the canvas array."
+  [^SpriteData ctx pixel-x raw-tile-index fine-y current-screen-y collision-atom]
   ;; Extract context fields directly from the primitive record to avoid reflection or map lookups
   (let [sx                 (int pixel-x)
         sprite-tile-base   (int (.-sprite-tile-base ctx))
@@ -604,11 +625,10 @@
         img-pixels         ^ints (.-img-pixels ctx)
         
         ;; 1. 8x16 SPRITE TILE INDEX CALCULATIONS
-        ;; Real SMS Rule: In 8x16 mode, the tile index specified in the SAT applies to the top half.
-        ;; The VDP automatically forces an index increment for the bottom half tile pattern row.
         tile-offset        (int (quot fine-y 8))
         actual-tile-index  (int (if large-sprites? 
-                                  (+ (int (signed->unsigned raw-tile-index)) tile-offset) 
+                                  ;; SMS Hardware Rule: Force bit 0 to 0 for 8x16 sprites
+                                  (+ (bit-and (int (signed->unsigned raw-tile-index)) 0xFE) tile-offset) 
                                   raw-tile-index))
         final-sprite-tile  (int (+ actual-tile-index sprite-tile-base))
         tile-fine-y        (int (mod fine-y 8))
@@ -617,36 +637,45 @@
     ;; 2. HORIZONTAL PIXEL LOOP
     (dotimes [x 8]
       (let [color-idx (int (get-gg-pixel-color-idx vram-bytes final-sprite-tile tile-fine-y (int x)))]
-        ;; Hardware Rule: Sprite color index 0 is always transparent and does not paint.
+        ;; Hardware Rule: Sprite color index 0 is always transparent and does not paint or cause collisions.
         (when (> color-idx 0)
           (let [current-screen-x (int (+ sx (int x)))]
             ;; Boundary protection against offscreen horizontal coordinates (viewport clipping)
             (when (and (>= current-screen-x 0) (< current-screen-x 256))
               (let [dest-idx         (int (+ dest-row-offset current-screen-x))
                     
-                    ;; 3. DECODE BACKGROUND LAYER METADATA
+                    ;; 3. DECODE BACKGROUND LAYER METADATA AND CHECK FOR COLLISION
                     ;; Wrap read values in unchecked-int to bypass safe integer conversion traps.
                     bg-pixel-raw     (unchecked-int (aget img-pixels dest-idx))
+                    
+                    ;; HARDWARE COLLISION CHECK: If Bit 29 is already set, another sprite solid pixel is here!
+                    _ (when (not= 0 (bit-and bg-pixel-raw 0x20000000))
+                        (reset! collision-atom true))
+                    
+                    ;; Inject Bit 29 into our metadata track to flag this coordinate for future sprites
+                    marked-bg-pixel (unchecked-int (bit-or bg-pixel-raw 0x20000000))
+
                     ;; Extract 4-bit color index stored at bits 25-28 of the background pixel
                     bg-color-idx     (int (bit-and (bit-shift-right bg-pixel-raw 25) 0x0F))
                     ;; Extract 1-bit background priority flag stored at bit 24
                     bg-has-priority? (not= 0 (bit-and bg-pixel-raw 0x01000000))
                     
                     ;; 4. EVALUATE LAYER MIXING PRIORITY
-                    ;; The sprite wins if the background tile lacks priority,
-                    ;; OR if the background tile has priority but this individual pixel is transparent (index 0).
                     should-draw?     (or (not bg-has-priority?) 
                                          (= bg-color-idx 0))]
                 
-                (when should-draw?
+                (if should-draw?
                   (let [;; SMS sprites map exclusively to the second 16-color block of the system palette
                         sprite-color-idx (int (+ color-idx 16))
                         pixel-color      (int (aget color-palette-cache sprite-color-idx))]
                     ;; Commit pixel to frame buffer array:
-                    ;; - Keep bits 24-31 unchanged (retains background metadata for subsequent calculations)
+                    ;; - Keep bits 24-31 unchanged (retains background AND our newly set sprite collision metadata)
                     ;; - Overwrite bits 0-23 with the new 24-bit sprite RGB values
-                    (aset img-pixels dest-idx (bit-or (bit-and bg-pixel-raw 0xFF000000) 
-                                                      (bit-and pixel-color 0x00FFFFFF)))))))))))))
+                    (aset img-pixels dest-idx (bit-or (bit-and marked-bg-pixel 0xFF000000) 
+                                                      (bit-and pixel-color 0x00FFFFFF))))
+                  ;; Even if hidden by background priority, write back the marked metadata 
+                  ;; because overlapping hidden sprites STILL trigger hardware collisions!
+                  (aset img-pixels dest-idx marked-bg-pixel))))))))))
 
 (defn draw-all-sprites-line-for-scanline!
   "Takes a Quil image with the current background drawn on it.
@@ -665,39 +694,42 @@
         ^SpriteData ctx     (parse-sprite-data vdp-regs vram-bytes color-palette-cache img-pixels)
         sat-base-addr       (int (.-sat-base-addr ctx))
         sat-info-table      (int (.-sat-info-table ctx))
-        sprite-height       (int (if (.-large-sprites? ctx) 16 8))]
+        sprite-height       (int (if (.-large-sprites? ctx) 16 8))
+        ;; Local mutable accumulator thread context to collect line intersections safely
+        collision-triggered? (atom false)]
 
     ;; Loop through all 64 possible sprite descriptors stored inside the Sprite Attribute Table (SAT)
-    (loop [sprite-id (int 0)]
-      (when (< sprite-id 64)
-        (let [y-addr (int (+ sat-base-addr sprite-id))
-              raw-y  (int (if (< y-addr vram-len) (signed->unsigned (aget vram-bytes y-addr)) 0))]
-          
-          ;; A vertical coordinate entry of 0xD0 signals the VDP to drop subsequent sprite calculations.
-          ;; Real SMS Exception: This rule is disabled completely when running in extended 224-line mode.
-          (when (or mode-224? (not= raw-y 0xD0))
-            (let [;; Internal SMS quirk: Y positions in the SAT are offset by -1.
-                  ;; Adding 1 aligns the execution cleanly to target screen spaces.
-                  sprite-y (int (inc raw-y))
-                  ;; Measure distance from current scanline to evaluate intersection matrix bounds
-                  fine-y   (int (- scanline sprite-y))]
-              
-              ;; VERTICAL SCANLINE INTERSECTION EVALUATION
-              (when (and (>= fine-y 0) (< fine-y sprite-height))
-                (let [info-idx       (int (* sprite-id 2))
-                      x-addr         (int (+ sat-info-table info-idx))
-                      ;; In the secondary SAT structure, the pattern/tile index is the byte right after the X coordinate
-                      tile-addr      (int (inc x-addr))
-                      
-                      ;; Fetch properties from secondary SAT tracking offset arrays (X coordinates & Tile indices)
-                      sprite-x       (int (if (< x-addr vram-len) (signed->unsigned (aget vram-bytes x-addr)) 0))
-                      raw-tile-index (int (if (< tile-addr vram-len) (signed->unsigned (aget vram-bytes tile-addr)) 0))]
-                  
-                  ;; Fire single-row renderer for matching intersection targets
-                  (draw-single-sprite-line! ctx sprite-x raw-tile-index fine-y scanline)))
-              
-              ;; Advance to parse the next sprite entry block
-              (recur (inc sprite-id)))))))))
+    ;; 1. First, find which sprites actually hit this scanline (up to the 8-sprite limit)
+    ;; They will be returned as a verctor of maps.
+    (let [matching-sprites
+          (loop [sprite-id (int 0) acc []]
+            (if (and (< sprite-id 64) (< (count acc) 8)) ; Stop at 64 sprites OR 8 matches
+              (let [y-addr (int (+ sat-base-addr sprite-id))
+                    raw-y  (int (if (< y-addr vram-len) (signed->unsigned (aget vram-bytes y-addr)) 0))]
+                (if (and (not mode-224?) (= raw-y 0xD0)) acc ;; A vertical coordinate entry of 0xD0 signals the VDP to drop subsequent sprite calculations.
+                  (let [sprite-y (int (inc raw-y))
+                        fine-y   (int (- scanline sprite-y))]
+                    ;; VERTICAL SCANLINE INTERSECTION CHECK
+                    (if (and (>= fine-y 0) (< fine-y sprite-height))
+                      ;; Sprite intersects with scanline. Gather its data and continue.
+                      (let [info-idx       (int (* sprite-id 2))
+                            x-addr         (int (+ sat-info-table info-idx))
+                            tile-addr      (int (inc x-addr))
+                            sprite-x       (int (if (< x-addr vram-len) (signed->unsigned (aget vram-bytes x-addr)) 0))
+                            raw-tile-index (int (if (< tile-addr vram-len) (signed->unsigned (aget vram-bytes tile-addr)) 0))]
+                        (recur (inc sprite-id) (conj acc {:x sprite-x :tile raw-tile-index :fine-y fine-y})))
+                      ;; Didn't intersect, just check the next sprite
+                      (recur (inc sprite-id) acc)))))
+              acc))]
+
+      ;; 2. DRAW BACKWARD: Iterate from the end of our list back to index 0
+      ;; This guarantees Sprite 0 details overwrite higher indices on the canvas!
+      (doseq [sprite (rseq matching-sprites)]
+        (draw-single-sprite-line! ctx (:x sprite) (:tile sprite) (:fine-y sprite) scanline collision-triggered?)))
+    
+    ;; If update the VDP flag if draw-single-sprite-line! indicated there was a sprite collision.
+    (when @collision-triggered?
+      (swap! active-vdp assoc :sprite-collision? true))))
 
 ;; --------------------------------------------------------------------------------------------------
 ;; --------------------------------------- Z80 Instruction Loop -------------------------------------
@@ -731,101 +763,76 @@
 ;; (reset! global-frame-buffer (q/create-image 256 224 :rgb))
 (def global-frame-buffer (atom nil))
 
+;; NOTE: Changed the instruction loop for teh GG version.
 (defn do-instruction-loop!
-  "Executes a single PAL frame scanline-by-scanline (313 lines total).
-  Runs the CPU instructions and draws the graphics."
   [^com.codingrodent.microprocessor.Z80.Z80Core cpu
    ^com.codingrodent.microprocessor.IMemory memory-bus]
-  (let [;; PAL Sega Master System metrics: 313 total scanlines per frame (0 to 312).
-        lines-per-frame 313
-        ;; Every scanline lasts exactly 228 CPU T-states (cycles). 
-        ;; Total frame footprint = 313 lines * 228 cycles = 71,364 cycles per frame (~50Hz).
+  (let [lines-per-frame 313
         cycles-per-line 228
-        ;; The VDP's register 10 holds a counter that is crucial the the timing of the H-BLANK.
-        ;; The Master System triggers an H-BLANK interrupt only if this counter rolls over below zero.
         line-interrupt-counter (atom (get-vdp-reg10))
-        ;; Extract the raw PImage canvas object out of the thread atom container once per frame
         frame-canvas ^processing.core.PImage @global-frame-buffer]
     
-    ;; Open the direct 1D primitive pixel array for unchecked mutations
     (.loadPixels frame-canvas)
     
     (dotimes [scanline lines-per-frame]
       (let [start-tstates (.getTStates cpu)
             target-tstates (+ start-tstates cycles-per-line)]
         
-        ;; Keep VDP state synchronized with the current hardware horizontal raster layer
         (swap! active-vdp assoc :current-scan-line scanline)
-        
+
+        ;; ====================================================================
+        ;; NEW UNIFIED INTERRUPT PIN SYNCHRONIZATION
+        ;; ====================================================================
+        ;; Calculate the physical INT line state based on active latches 
+        ;; combined with their individual enable registers.
+        (let [vdp-state @active-vdp
+              vblank-asserted? (and (:vblank-active? vdp-state) (vblank-irq-enabled?))
+              hblank-asserted? (and (:hblank-active? vdp-state) (hblank-irq-enabled?))]
+          (if (or vblank-asserted? hblank-asserted?)
+            (.setInterrupt cpu true)
+            (.setInterrupt cpu false)))
+
         ;; 1. PROCESS Z80 CPU INSTRUCTIONS FOR THIS SCANLINE
-        ;; Step the Z80 processor repeatedly until it consumes exactly 228 cycle T-states.
         (loop []
           (when (< (.getTStates cpu) target-tstates)
             (.executeOneInstruction cpu)
             (recur)))
         
         ;; 2. RUN LINE RENDERING FUNCTIONS
-        ;; Only render within the standard 224-line limit.
         (when (< scanline 224)
           (let [current-vdp @active-vdp
                 vdp-regs    ^ints (:regs current-vdp)
-                ;; Bit 3 of VDP Register 1 controls standard 192-line mode vs extended 224-line mode
                 reg1        (int (if (and vdp-regs (>= (alength vdp-regs) 2)) (aget vdp-regs 1) 0))
                 mode-224?   (not= 0 (bit-and reg1 0x08))
                 active-limit (if mode-224? 224 192)]
-            ;; ALWAYS draw the background line. This ensures that when the system is in 192-line mode,
-            ;; lines 192 to 223 automatically drop into the overscan loop to draw a clean uniform border.
             (draw-background-line! current-vdp frame-canvas scanline)
-            ;; ONLY compute foreground sprites and run collision grid checks during active video display lines
             (when (< scanline active-limit)
-              (draw-all-sprites-line-for-scanline! frame-canvas scanline mode-224?)
-              (swap! active-vdp check-sprite-collision!))))
+              (draw-all-sprites-line-for-scanline! frame-canvas scanline mode-224?))))
         
         ;; 3. HANDLE H-BLANK
-        ;; The VDP line counter decrements on every active scanline.
         (if (<= scanline 192)
           (let [current-count @line-interrupt-counter
                 new-count (dec current-count)]
-            ;; When the counter underflows below 0, reset it from VDP Register 10 and request a CPU interrupt.
             (if (< new-count 0)
               (do
-                ;; Counter underflowed! Reload from VDP Register 10
                 (reset! line-interrupt-counter (get-vdp-reg10))
-                ;; Trigger CPU Interrupt if the game requested H-Blank IRQs
-                ;; We have just processed a whole single scan-line with the loop above.
-                ;; So, we can trigger an interrupt to let the game know there is a short time
-                ;; before we snap back and process another scan-line.
-                (when (hblank-irq-enabled?)
-                  (.setInterrupt cpu true)))
-              ;; Decrement counter normally
+                ;; Fix: Mutate the VDP state atom flag, NOT the CPU pin!
+                (swap! active-vdp assoc :hblank-active? true))
               (reset! line-interrupt-counter new-count)))
-          ;; Outside the active window, the counter continually reloads from Register 10
           (reset! line-interrupt-counter (get-vdp-reg10)))
         
         ;; 4. HANDLE V-BLANK
-        ;; Trigger a VBlank on the last visible scanline, so that games have time to update
-        ;; before we go back to scanline 1 and start processing a new frame. This will be a significant pause.
-        ;; This is the longest most crucial synchronization event.
-        ;; During V-BLANK the VRAM is fully accessible without disrupting the display.
-        ;; Games use this window to: Update sprite positions (moving characters, enemies, projectiles),
-        ;; Load new tile graphics into VDP memory and more.
         (when (= scanline 193)
-          (swap! active-vdp assoc :vblank-active? true)
-          (when (vblank-irq-enabled?)
-            (.setInterrupt cpu true)))
+          ;; Fix: Mutate the VDP state atom flag, NOT the CPU pin!
+          (swap! active-vdp assoc :vblank-active? true))
         
         ;; 5. END OF FRAME CLEANUP
-        ;; On the very last scanline of the PAL cycle loop, sanitize the image buffer pixels.
         (when (= scanline 312)
           (swap! active-vdp assoc :vblank-active? false)
           (let [pixels-arr ^ints (.pixels frame-canvas)]
             (dotimes [i (alength pixels-arr)]
-              ;; - (bit-and ... 0x00FFFFFF) completely strips out our internal layer sorting metadata mask.
-              ;; - (bit-or 0xFF000000 ...) sets Alpha back to 0xFF (100% opaque) so Quil doesn't render it as black.
-              ;; - Wrapped in unchecked-int to suppress Clojure's signed integer overflow arithmetic exceptions.
               (aset pixels-arr i (unchecked-int (bit-or 0xFF000000 
                                                         (bit-and (aget pixels-arr i) 0x00FFFFFF)))))))))
-    ;; Finalize mutations and push the primitive pixel array modifications back into the Quil canvas
     (.updatePixels frame-canvas)))
 
 ;; --------------------------------------------------------------------------------------------------
@@ -833,8 +840,8 @@
 ;; --------------------------------------------------------------------------------------------------
 
 (defn setup []
-  ;; This should be the accurate FPS for a PAL console.
-  (q/frame-rate 50)
+  ;; NOTE: Changed this for the GG version. The GG runs at 60 FPS.
+  (q/frame-rate 60)
   (reset! global-frame-buffer (q/create-image 256 224 :rgb))
   ;; Reset the Sega Mapper to its standard power-on baseline state
   (reset! mapper-banks {:slot0 0
@@ -855,22 +862,48 @@
   []
   (.textureSampling (q/current-graphics) 2))
 
+(defn draw-scanlines! [screen-width screen-height opacity]
+  (q/stroke 0 0 0 opacity) ; Black lines with custom transparency (0-255)
+  (q/stroke-weight 2)      ; 2 pixels thick lines
+  (loop [y 0]
+    (when (< y screen-height)
+      (q/line 0 y screen-width y)
+      (recur (+ y 5)))))    ; Skip every 5th line to create the gaps
+
 ;; NOTE: Fixed for the GG version.
 ;; The image is cropped to standard GG dimensions.
 (defn draw []
   ;; 1. Execute Z80 code line-by-line while filling 'global-frame-buffer'
   (do-instruction-loop! cpu memory-bus)
-  
+
   ;; 2. Force Nearest Neighbor sampling to preserve retro pixel art sharpness
-  ;; (set-nearest-neighbor!)
-  
+  (set-nearest-neighbor!)
+
   ;; 3. Crop and paint the Game Gear viewport
   (let [frame-canvas @global-frame-buffer
         ;; Extract the centered 160x144 window (X: 48 to 207, Y: 24 to 167)
         gg-viewport (.get ^processing.core.PImage frame-canvas 48 24 160 144)]
-    
+
     ;; Paint the cropped view scaled up to your target screen dimensions
-    (q/image gg-viewport 0 0 screen-width screen-height)))
+    (q/image gg-viewport 0 0 screen-width screen-height))
+
+  (draw-scanlines! screen-width screen-height 40)
+  ;; Display FPS.
+  #_(let [raw-fps (q/current-frame-rate)
+        fps-text (format "FPS: %.1f" raw-fps)]
+
+    ;; Configure the font settings
+    (q/text-size 16)
+
+    ;; Draw a subtle black drop shadow behind the text for readability
+    (q/fill 0 0 0)
+    (q/text fps-text 11 21) ; Offset by 1 pixel down and right
+
+    ;; Draw the actual foreground text in bright green (or white)
+    (q/fill 255 255 255)
+    (q/text fps-text 10 20) ; X=10, Y=20 coordinates from the top-left corner
+    ;; We're drawing the FPS counter twice, because we're trying to achieve a 'bold' text effect.
+    (q/text fps-text 11 20)))
 
 ;; --------------------------------------------------------------------------------------------------
 ;; ----------------------------------------- JoyPad Handling ----------------------------------------
@@ -932,7 +965,7 @@
           (swap! joypad-p1 #(bit-and % (bit-not bit-p1))))
         ;; Player 2
         (when-let [bit-p2 (get p2-key-map user-input)]
-          (if (or (= user-input :up) (= user-input :down))
+          (if (or (= user-input \i) (= user-input \k))
             (swap! joypad-p1 #(bit-and % (bit-not bit-p2)))
             (swap! joypad-p2 #(bit-and % (bit-not bit-p2)))))))))
 
@@ -950,7 +983,7 @@
         (when-let [bit-p1 (get p1-key-map user-input)]
           (swap! joypad-p1 #(bit-or % bit-p1)))
         (when-let [bit-p2 (get p2-key-map user-input)]
-          (if (or (= user-input :up) (= user-input :down))
+          (if (or (= user-input \i) (= user-input \k))
             (swap! joypad-p1 #(bit-or % bit-p2))
             (swap! joypad-p2 #(bit-or % bit-p2))))))))
 
@@ -970,4 +1003,9 @@
           :key-released handle-key-release
           :size [screen-width screen-height]
           :setup setup
-          :draw draw))))
+          :draw draw
+          ;; This executes exactly once right as the Quil window closes
+          ;; This is the proper way to save SRAM for the Game Gear as some game use it to supplement
+          ;; the system's 8KB of work RAM. For example Shinig Force Gaiden actively does this.
+          ;; The game makes thousands of writes per second to SRAM, so constantly saving to disk is wasteful.
+          :on-close (fn [] (save-sram-to-disk!))))))

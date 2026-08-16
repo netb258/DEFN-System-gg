@@ -1,0 +1,1 @@
+The emulator's battery saves go here.
